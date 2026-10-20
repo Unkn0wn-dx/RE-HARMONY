@@ -525,7 +525,7 @@ def main() -> int:
         help=(
             "besides the usual text, prints ONE JSON line (the last "
             "line of stdout) with the whole dict -- so that a subprocess "
-            "caller (app/remote_status.py) no tenga que raspar '%-24s %s'"
+            "caller (app/remote_status.py) no tenga que raspar '%%-24s %%s'"
         ),
     )
     a = ap.parse_args()
