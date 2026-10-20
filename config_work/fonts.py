@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import functools
+import hashlib
 import pathlib
 
 BASE = 0x040000
@@ -163,6 +165,228 @@ INV: dict[str, int] = {v: k for k, v in GLYPHS.items()}
 # anchored in the factory text "Exit" / "Press Exit now.").
 MAYUSCULAS_AUSENTES = "QXZ"
 
+# ==========================================================================
+# THE HARMONY ONE+: the font is assembled PER CONFIG.
+#
+# Measured on a Harmony One+ (arch 12, skin 54, firmware 3.4, French
+# firmware). Its section [7] carries the French accents (é è à ê â û) plus
+# `( ) ; & ? * Q`, and `X`/`Z` are still missing. Unlike the One, the
+# code -> character mapping is NOT fixed: two dumps of the same remote,
+# before and after adding one device, keep 0x01..0x42 and reassign every
+# code from 0x43 up (81 slots before, 82 after). So a One+ blob is read with
+# `one_plus_table()`, which identifies each code by the SHAPE of its bitmaps
+# against `glyph_shapes_one_plus.SHAPES_ONE_PLUS`.
+#
+# `GLYPHS_ONE_PLUS` below is the reading of ONE dump -- the one the shapes
+# were taken from -- and decodes ONLY that dump. Read the same way as
+# `GLYPHS`:
+#   (a) SHAPE: every code's bitmap rendered and read by eye (82/82);
+#   (b) SEMANTICS: factory texts read as French -- "La sensibilité de
+#       l'écran est", "Touchez l'écran pour", "Un véritable jeu d'enfant!",
+#       "Initialisation", "LED IR";
+#   (c) KNOWN PLAINTEXT: the name and command labels of a device added
+#       through MyHarmony show up ONLY in the dump taken after the sync,
+#       encoded with this table.
+# [ASSUMED] 0x4A: a 5x5 sign, `*` or `+`; one command label uses it, no
+#           firmware text pins it.
+# [ASSUMED] 0x23 `l` / 0x3A `I`: identical bitmaps, told apart by context
+#           ("Initialisation", "LED IR", "ID").
+# ==========================================================================
+GLYPHS_ONE_PLUS: dict[int, str] = {
+    0x01: "H",
+    0x02: "y",
+    0x03: "D",
+    0x04: "i",
+    0x05: "m",
+    0x06: "L",
+    0x07: "u",
+    0x08: "n",
+    0x09: "M",
+    0x0A: "a",
+    0x0B: "r",
+    0x0C: "e",
+    0x0D: "J",
+    0x0E: "V",
+    0x0F: "S",
+    0x10: "1",
+    0x11: "2",
+    0x12: ":",
+    0x13: "3",
+    0x14: "4",
+    0x15: "5",
+    0x16: "6",
+    0x17: "7",
+    0x18: "8",
+    0x19: "9",
+    0x1A: "0",
+    0x1B: "/",
+    0x1C: " ",
+    0x1D: "v",
+    0x1E: "d",
+    0x1F: "s",
+    0x20: "b",
+    0x21: "t",
+    0x22: "f",
+    0x23: "l",
+    0x24: BLANCO_ANCHO,  # 4 px blank, the One's 0x41
+    0x25: "!",
+    0x26: "O",
+    0x27: "K",
+    0x28: "C",
+    0x29: "o",
+    0x2A: "x",
+    0x2B: "U",
+    0x2C: "B",
+    0x2D: "é",
+    0x2E: "à",
+    0x2F: "j",
+    0x30: "c",
+    0x31: "A",
+    0x32: "p",
+    0x33: "g",
+    0x34: ".",
+    0x35: "P",
+    0x36: "è",
+    0x37: "h",
+    0x38: "z",
+    0x39: "W",
+    0x3A: "I",
+    0x3B: "E",
+    0x3C: "R",
+    0x3D: "F",
+    0x3E: "'",
+    0x3F: "q",
+    0x40: "N",
+    0x41: "\\",
+    0x42: "T",
+    0x43: "-",
+    0x44: "?",
+    0x45: "ê",
+    0x46: "w",
+    0x47: "(",
+    0x48: ")",
+    0x49: "G",
+    0x4A: "*",
+    0x4B: ",",
+    0x4C: "Q",
+    0x4D: "&",
+    0x4E: ";",
+    0x4F: "â",
+    0x50: "k",
+    0x51: "Y",
+    0x52: "û",
+}
+assert len(GLYPHS_ONE_PLUS) == 82, "the One+ table has %d codes, not 82" % len(
+    GLYPHS_ONE_PLUS
+)
+assert len(set(GLYPHS_ONE_PLUS.values())) == 82, "One+ table is NOT bijective"
+
+def font_slots(blob) -> int | None:
+    """Slots per font that section [7] declares, or `None` if the section
+    cannot be read. NOT a firmware fingerprint: the font only goes up to
+    the highest code the config uses (two dumps of the same One+, before
+    and after adding a device, declare 81 and 82)."""
+    b = _bytes(blob)
+    try:
+        off = u24(b, MAESTRO_SECCION7) - BASE
+        f = u24(b, off + 2) - BASE
+        return u16(b, f + 1)
+    except IndexError:
+        return None
+
+
+def _blank(b: bytes, code: int) -> bool | None:
+    """`True` if every font that has `code` draws it with no lit pixel,
+    `False` if one draws something, `None` if no font has it."""
+    seen = False
+    for f in fonts_by_attribute(b).values():
+        p = f["ptr"][code - 1] if code - 1 < len(f["ptr"]) else 0
+        if not p:
+            continue
+        got = _rle(b, p + 1)
+        if got is None:
+            return None
+        if any(kind == "lit" for row in got[2] for kind, _n, _o in row):
+            return False
+        seen = True
+    return True if seen else None
+
+
+def shape_key(b: bytes, p: int) -> str | None:
+    """Fingerprint of the glyph bitmap at `p`: its outline (lit / skipped
+    pixels, no colors) hashed, see `glyph_shapes_one_plus.py`."""
+    got = _rle(b, p + 1)
+    if got is None:
+        return None
+    w, _h, rows = got
+    mask = "/".join(
+        "".join(("1" if kind == "lit" else "0") * n for kind, n, _o in row)
+        for row in rows
+    )
+    return hashlib.sha1(("%d:%s" % (w, mask)).encode()).hexdigest()[:12]
+
+
+@functools.lru_cache(maxsize=8)
+def one_plus_table(b: bytes) -> dict[int, str]:
+    """THIS One+ blob's code -> character table, read off its own bitmaps.
+
+    Every font votes for each code it draws, with the character its outline
+    has in `SHAPES_ONE_PLUS`. An outline shared by two characters (`l`/`I`)
+    does not vote; such a code is settled by elimination once the others
+    are known. A code with no recognized outline, two codes claiming the
+    same character, or one code with two readings are left OUT of the table:
+    they decode as `?` and `encode()` refuses them -- never guessed."""
+    from glyph_shapes_one_plus import SHAPES_ONE_PLUS  # noqa: PLC0415
+
+    votes: dict[int, collections.Counter] = collections.defaultdict(
+        collections.Counter
+    )
+    shared: dict[int, set[str]] = {}
+    for f in fonts_by_attribute(b).values():
+        for i, p in enumerate(f["ptr"]):
+            if not p:
+                continue
+            chars = SHAPES_ONE_PLUS.get(shape_key(b, p) or "")
+            if chars is None:
+                continue
+            if len(chars) == 1:
+                votes[i + 1][chars] += 1
+            else:
+                shared.setdefault(i + 1, set(chars)).intersection_update(chars)
+    out = {c: v.most_common(1)[0][0] for c, v in votes.items() if len(v) == 1}
+    for c, chars in shared.items():
+        left = chars - set(out.values())
+        if c not in votes and len(left) == 1:
+            out[c] = left.pop()
+    claimed = collections.Counter(out.values())
+    return {c: ch for c, ch in out.items() if claimed[ch] == 1}
+
+
+def glyphs_for(blob) -> dict[int, str]:
+    """The glyph table THIS blob is written with. A One+ is told apart by
+    PIXELS -- its space is 0x1C (blank) and its 0x1E is `d`; on the One 0x1C
+    is `0` and 0x1E is the space -- and gets `one_plus_table()`. Anything
+    else (the One, a short or garbled blob) gets `GLYPHS`, which is exactly
+    what every caller used before the One+ was measured."""
+    b = _bytes(blob)
+    return one_plus_table(b) if is_one_plus(b) else GLYPHS
+
+
+def is_one_plus(blob) -> bool:
+    """`True` for a One+ font (0x1C blank, 0x1E drawn), see `glyphs_for()`."""
+    b = _bytes(blob)
+    try:
+        return _blank(b, 0x1C) is True and _blank(b, 0x1E) is False
+    except IndexError:
+        return False
+
+
+def inv_for(blob) -> dict[str, int]:
+    """`glyphs_for(blob)` inverted: character -> code."""
+    t = glyphs_for(blob)
+    return INV if t is GLYPHS else {v: k for k, v in t.items()}
+
+
 # Palette of the user screens (white + antialias 0x31a6, which read
 # little-endian is the 0xa631 that ESTADO.md cites). Attributes 1, 4 and 9.
 PALETA_USUARIO = (0x31A6, 0xFFFF)
@@ -243,9 +467,10 @@ def coverage(blob) -> dict[int, set[str]]:
     """`{attribute: set(characters that font CAN actually draw)}`, computed by
     reading the blob's section [7] -- not hardcoded."""
     out: dict[int, set[str]] = {}
+    tabla = glyphs_for(blob)
     for attr, f in fonts_by_attribute(blob).items():
         out[attr] = {
-            GLYPHS[i + 1] for i, p in enumerate(f["ptr"]) if p and (i + 1) in GLYPHS
+            tabla[i + 1] for i, p in enumerate(f["ptr"]) if p and (i + 1) in tabla
         }
     return out
 
@@ -328,7 +553,7 @@ def choose_detail(text: str, blob, contexto: int | None = None, preferidos=None)
     r = {
         "atributo": None,
         "valid_attributes": [],
-        "missing": {c for c in text if c not in INV},
+        "missing": set(text) - set(inv_for(b)),
         "warning": None,
         "paleta": None,
         "height": None,
@@ -415,7 +640,8 @@ def encode(text: str, atributo: int, blob) -> bytes | None:
     chars = coverage(blob).get(atributo)
     if chars is None or not set(text) <= chars:
         return None
-    return bytes(INV[c] for c in text) + b"\x00"
+    inv = inv_for(blob)
+    return bytes(inv[c] for c in text) + b"\x00"
 
 
 def width(text: str, atributo: int, blob) -> int:
@@ -428,8 +654,9 @@ def width(text: str, atributo: int, blob) -> int:
     if f is None:
         raise ValueError("attribute %r does not exist in section [7]" % (atributo,))
     total = 0
+    inv = inv_for(b)
     for c in text:
-        code = INV.get(c)
+        code = inv.get(c)
         if code is None:
             raise ValueError("character %r outside the glyph cipher" % c)
         if code - 1 >= len(f["ptr"]) or not f["ptr"][code - 1]:
@@ -530,9 +757,22 @@ CENTINELAS = (
     "It's that easy!",
 )
 
+#: Same role for the One+ (French firmware). Firmware texts only, none of
+#: the user's device or activity names, so any One+ dump carries them.
+CENTINELAS_ONE_PLUS = (
+    "Initialisation",
+    "Dispositifs",
+    "Bienvenue!",
+    "Un véritable jeu d'enfant!",
+    "démarrage\\Echec de la mise à",
+    "Février",
+)
+
 
 def _check(blob_path: str) -> bool:
     b = pathlib.Path(blob_path).read_bytes()
+    tabla = glyphs_for(b)
+    centinelas = CENTINELAS if tabla is GLYPHS else CENTINELAS_ONE_PLUS
     fonts = fonts_by_attribute(b)
     cob, pal, alt = coverage(b), palettes(b), heights(b)
     ok: dict[str, bool] = {}
@@ -570,7 +810,7 @@ def _check(blob_path: str) -> bool:
 
     # (b) SEMANTICS -----------------------------------------------------------
     textos = _factory_texts(b)
-    sin = [(a, c) for a, c in textos if any(g not in GLYPHS for g in c)]
+    sin = [(a, c) for a, c in textos if any(g not in tabla for g in c)]
     ok["semantica"] = not sin
     print(
         "(b) SEMANTICS: %d factory (attr, text) pairs, %d untranslated -> %s"
@@ -578,18 +818,18 @@ def _check(blob_path: str) -> bool:
     )
     for a, c in sin[:5]:
         print(
-            "      attr=%d unresolved: %s" % (a, [hex(g) for g in c if g not in GLYPHS])
+            "      attr=%d unresolved: %s" % (a, [hex(g) for g in c if g not in tabla])
         )
     trad = [
-        (a, "".join(GLYPHS[g] for g in c), c)
+        (a, "".join(tabla[g] for g in c), c)
         for a, c in textos
-        if not any(g not in GLYPHS for g in c)
+        if not any(g not in tabla for g in c)
     ]
     frases = {s for _, s, _ in trad}
-    vivos = [w for w in CENTINELAS if w in frases]
+    vivos = [w for w in centinelas if w in frases]
     print(
         "      factory sentinels present: %d/%d  %s"
-        % (len(vivos), len(CENTINELAS), vivos[:3])
+        % (len(vivos), len(centinelas), vivos[:3])
     )
 
     # (c) STRUCTURE -----------------------------------------------------------
@@ -613,10 +853,13 @@ def _check(blob_path: str) -> bool:
     nonull = {
         (a, i + 1) for a, f in fonts.items() for i, p in enumerate(f["ptr"]) if p
     }
-    ok["anclaje"] = used == set(GLYPHS)
+    # only the codes this font declares: a One+ font stops at the highest
+    # code the config uses (81 or 82 slots); on the One that is all 71
+    declarados = {g for g in tabla if g <= (font_slots(b) or 0)}
+    ok["anclaje"] = used == declarados
     print(
-        "(d) ANCHOR: %d/71 codes appear in >=1 factory text -> %s"
-        % (len(used), "OK" if ok["anclaje"] else "FAIL")
+        "(d) ANCHOR: %d/%d codes appear in >=1 factory text -> %s"
+        % (len(used), len(declarados), "OK" if ok["anclaje"] else "FAIL")
     )
     print(
         "      non-null (font,code) slots: %d; exercised by factory: %d;"
@@ -659,7 +902,7 @@ def _check(blob_path: str) -> bool:
     #     does not notice -- which is exactly why the round-trip is not enough.
     ciclo = "PDEBLG"
     rot = {ciclo[i]: ciclo[(i + 1) % len(ciclo)] for i in range(len(ciclo))}
-    falsa = {k: rot.get(v, v) for k, v in GLYPHS.items()}
+    falsa = {k: rot.get(v, v) for k, v in tabla.items()}
     frases_f = {"".join(falsa[g] for g in c) for _, _, c in trad}
     inv_f = {v: k for k, v in falsa.items()}
     rt_f = sum(
@@ -673,10 +916,10 @@ def _check(blob_path: str) -> bool:
     # required to break: a sentence with none of them stays intact and its
     # survival says nothing (e.g. "It's that easy!", which has not a single
     # uppercase letter from the cycle).
-    tocados = [w for w in CENTINELAS if set(w) & set(ciclo)]
+    tocados = [w for w in centinelas if set(w) & set(ciclo)]
     sobreviven = [w for w in tocados if w in frases_f]
     alteradas = sum(1 for _, s, c in trad if s != "".join(falsa[g] for g in c))
-    ok["mutacion"] = not sobreviven and len(vivos) == len(CENTINELAS)
+    ok["mutacion"] = not sobreviven and len(vivos) == len(centinelas)
     print("(g) MUTATION (tampered table: bijective 6-letter cycle, %s)" % ciclo)
     print(
         "      round-trip with the FALSE table: %d/%d  <- this is why the"
@@ -691,7 +934,7 @@ def _check(blob_path: str) -> bool:
         " contain a cycle letter, %d survive the mutation -> %s"
         % (
             len(vivos),
-            len(CENTINELAS),
+            len(centinelas),
             len(tocados),
             len(sobreviven),
             "OK" if ok["mutacion"] else "FAIL",
@@ -700,15 +943,24 @@ def _check(blob_path: str) -> bool:
 
     # (h) NEGATIVES -------------------------------------------------------
     print("\n=== NEGATIVE CHECK ===")
-    negs = [
-        (
-            "choose('Philips', contexto=9) == 9  (the device row uses 9)",
-            choose("Philips", b, contexto=9) == 9,
-        ),
-        (
-            "choose('Philips', contexto=4) != 4  (attr 4 has no 'p')",
-            choose("Philips", b, contexto=4) != 4,
-        ),
+    # Attribute numbers below are the One's factory layout; the One+ arranges
+    # its 17 fonts differently, so those two only run against a One blob.
+    negs = []
+    if tabla is GLYPHS:
+        negs += [
+            (
+                "choose('Philips', contexto=9) == 9  (the device row uses 9)",
+                choose("Philips", b, contexto=9) == 9,
+            ),
+            (
+                "choose('Philips', contexto=4) != 4  (attr 4 has no 'p')",
+                choose("Philips", b, contexto=4) != 4,
+            ),
+        ]
+    inv = inv_for(b)
+    con_blanco = [a for a, ch in cob.items() if {"a", " "} <= ch]
+    attr_blanco = 9 if tabla is GLYPHS else (con_blanco[0] if con_blanco else None)
+    negs += [
         (
             "choose('Xbox') is None   (uppercase 'X' does not exist in any font)",
             choose("Xbox", b) is None,
@@ -722,8 +974,11 @@ def _check(blob_path: str) -> bool:
             choose("Señal@", b) is None,
         ),
         (
-            "encode(' ') uses 0x1e and NEVER 0x41  (the wide-blank bug)",
-            encode("a a", 9, b) == bytes([0x10, 0x1E, 0x10, 0x00]),
+            "encode(' ') uses %#04x and NEVER %#04x  (the wide-blank bug)"
+            % (inv[" "], inv[BLANCO_ANCHO]),
+            attr_blanco is not None
+            and encode("a a", attr_blanco, b)
+            == bytes([inv["a"], inv[" "], inv["a"], 0x00]),
         ),
     ]
     for etq, v in negs:

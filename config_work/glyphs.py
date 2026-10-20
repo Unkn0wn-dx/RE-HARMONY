@@ -221,6 +221,14 @@ COD_MIN = min(BASE)
 COD_MAX = max(BASE)
 
 
+def table_for(b: bytes) -> dict[int, str]:
+    """The complete table for THIS blob: `BASE` on a One, the 82-code one
+    (`fonts.GLYPHS_ONE_PLUS`) on a One+. Decided by the fonts' own pixels,
+    see `fonts.glyphs_for()`."""
+    t = fonts.glyphs_for(b)
+    return dict(BASE) if t is fonts.GLYPHS else dict(t)
+
+
 def vocabulario(cfg: str) -> set[str]:
     """Every plaintext name the Hub's config carries."""
     d = json.loads(pathlib.Path(cfg).read_text())
@@ -275,20 +283,23 @@ def compatible(cru: bytes, palabra: str, table: dict) -> bool:
 
 def extender(b: bytes, vocab: set[str], table: dict | None = None, vueltas: int = 8):
     """Learns new glyphs by elimination. Returns (table, learned)."""
-    table = dict(table or BASE)
+    completa = table_for(b)
+    table = dict(table or completa)
+    cod_min, cod_max = min(completa), max(completa)
     aprendidos = {}
     for _ in range(vueltas):
         # the candidate alphabet grows: any byte that shows up next to ones
         # already known could be a glyph still unresolved
-        # The upper bound is COD_MAX (0x47), not an eyeballed 0x60: section
-        # [7] declares exactly 71 slots, so 0x48 and up are not glyphs and
+        # The upper bound is the table's last code (0x47 on the One, 0x52 on
+        # the One+), not an eyeballed 0x60: section [7] declares exactly 71
+        # (or 82) slots, so anything above is not a glyph and
         # cannot be learned. With the table already complete this loop has
         # nothing left to learn and the only thing the old bound could still
         # admit was a byte that no font can draw.
         alfabeto = set(table) | {
             b[i]
             for i in range(1, len(b) - 1)
-            if b[i - 1] in table and COD_MIN <= b[i] <= COD_MAX
+            if b[i - 1] in table and cod_min <= b[i] <= cod_max
         }
         nuevos = {}
         for _off, cru in cadenas(b, alfabeto):

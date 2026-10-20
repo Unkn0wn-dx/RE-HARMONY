@@ -65,6 +65,7 @@ every other local name) was translated freely.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import pathlib
 import sys
@@ -147,7 +148,7 @@ def make_decoder(b: bytes, hub: str | None):
         What DOES deserve a warning is a byte outside the 71 codes, which is
         not a missing vocabulary but a bad pointer -- see `_AVISO_CODIGO`.
     """
-    table = dict(glyphs.BASE)
+    table = glyphs.table_for(b)
     warning = None
 
     if hub and pathlib.Path(hub).exists():
@@ -176,6 +177,7 @@ def make_decoder(b: bytes, hub: str | None):
         return "".join(table.get(c, "?") for c in crudo), all(c in table for c in crudo)
 
     decode.sin_tabla = sin_tabla  # type: ignore[attr-defined]
+    decode.table = table  # type: ignore[attr-defined]
     return decode, warning
 
 
@@ -185,10 +187,27 @@ def make_decoder(b: bytes, hub: str | None):
 #: text.
 _AVISO_CODIGO = (
     "a name carries byte(s) %s, which are NOT glyphs (section [7] declares "
-    "exactly 71 codes, 0x01..0x47). That is not a missing vocabulary: it is "
+    "a fixed set of codes: 0x01..0x47 on the One, 0x01..0x52 on the One+). "
+    "That is not a missing vocabulary: it is "
     "a text pointer that does not land on text. Those characters come out "
     "as '?'."
 )
+
+
+#: Offset of each line of a name split over two lines, from the row's text
+#: line (One+: a two-line name at Y 51 and 63 for a row at 57).
+WRAP_DY = 6
+
+
+def decode_line(decode, ptr: int | None, inline: bytes | None) -> tuple[str, bool]:
+    """One text line of a menu row through `decode`: by pointer (TXT) or
+    from its inline glyphs (TXTIN), with the same table and the same
+    completeness rule."""
+    if inline is None:
+        return decode(ptr)
+    table = decode.table
+    decode.sin_tabla.update(c for c in inline if c not in table)
+    return "".join(table.get(c, "?") for c in inline), all(c in table for c in inline)
 
 
 def row_ordinal(b: bytes, dest11: list[int], ident: int) -> int | None:
@@ -265,14 +284,22 @@ def menu_rows(
                 "sheet %d of tabla[6][%d]: invalid slot" % (h, ordinal_menu)
             )
         ins = D.disassemble(b, s["prog"] - D.BASE)
-        text_rows = sorted(
-            (ar[1], ar[2])
-            for _o, op, ar in ins
-            if op == "TXT"
-            and ar[0] == D.TAG_NAME
-            and (ar[1] - D.Y_ROW_0 - 19) % D.ROW_STEP == 0
-            and 0 <= (ar[1] - D.Y_ROW_0 - 19) // D.ROW_STEP < 8
-        )
+        # A row's name is a pointer TXT on the row's text line, or -- as the
+        # One+ firmware draws them -- an inline TXTIN, and a name too long
+        # for one line is split into two lines WRAP_DY above and below it
+        # (Y 51 and 63 around a row at 57). Lines are grouped
+        # by row, top to bottom, and the row's name is their join.
+        by_row: dict[int, list] = {}
+        for _o, op, ar in ins:
+            if op not in ("TXT", "TXTIN") or ar[0] != D.TAG_NAME:
+                continue
+            row_i, rem = divmod(ar[1] - D.Y_ROW_0 - 19 + WRAP_DY, D.ROW_STEP)
+            if rem not in (0, WRAP_DY, 2 * WRAP_DY) or not 0 <= row_i < 8:
+                continue
+            by_row.setdefault(row_i, []).append(
+                (ar[1], ar[2] if op == "TXT" else None, ar[2] if op == "TXTIN" else None)
+            )
+        text_rows = [sorted(by_row[r]) for r in sorted(by_row)]
 
         kr = D.read_key_register(b, s["keyreg"] - D.BASE) or []
         zones = zones19.get(s["K"], [])
@@ -294,7 +321,7 @@ def menu_rows(
                 )
             )
 
-        for row, ((_y, ptr), (cod, ident)) in enumerate(
+        for row, (lines, (cod, ident)) in enumerate(
             zip(text_rows, zone_entries), start=1
         ):
             screen_ordinal = row_ordinal(b, dest11, ident)
@@ -318,7 +345,9 @@ def menu_rows(
                         sorted(ks),
                     )
                 )
-            name, name_complete = decode(ptr)
+            parts = [decode_line(decode, ptr, inline) for _y, ptr, inline in lines]
+            name = " ".join(p for p, _ok in parts)
+            name_complete = all(ok for _p, ok in parts)
             out.append(
                 {
                     "name": name,
@@ -373,6 +402,22 @@ def main() -> int:
 
     ref_key = key(reference)
     out_of_sync = [o for o in candidates[1:] if key(by_menu[o]) != ref_key]
+    # On the One+ the replicas are separate screens (opened from the main
+    # screen, from Devices, from inside an activity) and one of them may list
+    # the same devices in another ORDER. There the check is on the set --
+    # same name, k1 and screen in every replica -- and the order reported is
+    # the one most replicas agree on. The One keeps the strict check.
+    if out_of_sync and glyphs.fonts.is_one_plus(b):
+        if all(sorted(key(by_menu[o])) == sorted(ref_key) for o in candidates):
+            orders = collections.Counter(tuple(key(by_menu[o])) for o in candidates)
+            best = orders.most_common(1)[0][0]
+            reference = next(by_menu[o] for o in candidates if tuple(key(by_menu[o])) == best)
+            print(
+                "note: menu objects %s list the same devices in another order"
+                % [o for o in candidates if tuple(key(by_menu[o])) != best],
+                file=sys.stderr,
+            )
+            out_of_sync = []
     if out_of_sync:
         raise SystemExit(
             "the menu objects don't match: %s differ from %s (%s vs %s)"
@@ -436,10 +481,11 @@ def main() -> int:
         # full blob sweep per activity name AND a table that could differ
         # from the one the device rows were read with.
         if inline is not None:
-            decode.sin_tabla.update(c for c in inline if c not in glyphs.BASE)
+            table = decode.table
+            decode.sin_tabla.update(c for c in inline if c not in table)
             return (
-                "".join(glyphs.BASE.get(c, "?") for c in inline),
-                all(c in glyphs.BASE for c in inline),
+                "".join(table.get(c, "?") for c in inline),
+                all(c in table for c in inline),
             )
         return decode(ptr)
 

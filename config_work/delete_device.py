@@ -517,7 +517,7 @@ def _decodificador(b: bytes):
     # way and the activities inside it another, depending on whether an
     # account export existed. And `complete` was decided by looking for '?'
     # in the OUTPUT, which is wrong now that 0x3E is a real question mark.
-    table = glyphs.BASE
+    table = glyphs.table_for(b)
 
     def dec(ptr, inline=None):
         if inline is not None:

@@ -284,8 +284,9 @@ def glyph_table(b: bytes) -> dict[int, str]:
     run `glyphs.extender()` against a hand-written `COMMAND_VOCAB` to guess
     the rest. Both were workarounds for an incomplete `glyphs.BASE`; a
     fourth copy of the same table is exactly how one of them drifts.
+    On a One+ it is that remote's table instead (`glyphs.table_for`).
     """
-    return dict(glyphs.BASE)
+    return glyphs.table_for(b)
 
 
 def encode(text: str, table: dict[int, str]) -> bytes:
